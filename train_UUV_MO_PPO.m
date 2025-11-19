@@ -13,7 +13,7 @@ nActions = 4;      % 1:forward 2:turn-left 3:turn-right 4:sonar
 kObj = 4;          % reward dimensions (time, coverage, sonar use, collision)
 
 %% Hyperparameters
-numEpisodes   = 5000;
+numEpisodes   = 3000;
 gamma         = 0.99;
 actorLR       = 1e-3;
 epsilonClip   = 0.2;
@@ -31,6 +31,17 @@ histCount = 0;
 weightWindowSize = 128;  % Sliding window for weight calculation
 updateWeightEvery = 10;
 warmupEpisodes = 100;
+
+%% Episode visualization configuration
+vizStartEp = 2773;                              % First episode to record
+vizEndEp = 2775;                                % Last episode to record
+videoFilename = 'UUV_episodes_2771_2775.mp4';   % Output video filename
+videoFrameRate = 10;                            % Frames per second
+videoQuality = 95;                              % Compression quality (0-100)
+showVortexField = true;                         % Enable/disable vortex visualization
+videoWriter = [];                               % VideoWriter object (initialized when needed)
+trajectoryBuffer = [];                          % Stores [x, y] positions for current episode
+episodeVizFigure = [];                          % Figure handle for rendering frames (separate from training monitor)
 
 %% Initialize visualization data structures
 history = struct();
@@ -86,6 +97,31 @@ for ep = 1:numEpisodes
 
     state = env.reset();
     maxSteps = env.maxSteps;
+    
+    % Initialize video recording at start of visualization range
+    if ep == vizStartEp
+        try
+            videoWriter = initializeVideoRecording(videoFilename, videoFrameRate);
+            if ~isempty(videoWriter)
+                fprintf('=== Starting video recording: Episodes %d-%d ===\n', vizStartEp, vizEndEp);
+            else
+                warning('Video recording initialization failed. Training will continue without visualization.');
+            end
+        catch ME
+            warning('Error initializing video recording: %s. Training will continue without visualization.', getReport(ME, 'basic'));
+            videoWriter = [];
+        end
+    end
+    
+    % Reset trajectory buffer for new episode
+    if ep >= vizStartEp && ep <= vizEndEp
+        try
+            trajectoryBuffer = [];
+        catch ME
+            warning('Error resetting trajectory buffer at ep %d: %s', ep, getReport(ME, 'basic'));
+            trajectoryBuffer = [];
+        end
+    end
 
     patchesEp    = zeros(patchSize, patchSize, 1, maxSteps, 'single');
     globalFeatEp = zeros(globalDim, maxSteps, 'single');
@@ -117,6 +153,30 @@ for ep = 1:numEpisodes
         [nextState, rVec, done, info] = env.step(a);
         rewardsEp(:, t) = rVec;
         state = nextState;
+        
+        % Capture frame for visualization
+        if ep >= vizStartEp && ep <= vizEndEp
+            % Add null check for videoWriter before frame operations
+            if ~isempty(videoWriter) && isvalid(videoWriter)
+                try
+                    % Append current UUV position to trajectory buffer
+                    trajectoryBuffer(end+1, :) = env.pos';
+                    
+                    % Create metrics structure with episode, timestep, coverage, rewards, action
+                    metrics = struct('episode', ep, ...
+                                     'timestep', t, ...
+                                     'coverage', info.coverage, ...
+                                     'rewards', rewardsEp(:, 1:t), ...
+                                     'action', a);
+                    
+                    % Call captureFrame() with current state
+                    captureFrame(videoWriter, env, trajectoryBuffer, metrics, showVortexField);
+                catch ME
+                    warning('Frame capture failed at ep %d, step %d: %s. Training continues.', ep, t, getReport(ME, 'basic'));
+                    % Training continues even if frame capture fails
+                end
+            end
+        end
     end
 
     T = t;
@@ -169,6 +229,49 @@ for ep = 1:numEpisodes
     % Update adaptive weights using Pearson correlation (Paper Eq. 28)
     if ep >= warmupEpisodes && mod(ep, updateWeightEvery) == 0 && histCount >= kObj
         w_obj = updateAdaptiveWeights(G_hist, U_hist, weightWindowSize);
+    end
+    
+    %% Render transition frame between episodes
+    if ep >= vizStartEp && ep <= vizEndEp
+        % Add null check for videoWriter before frame operations
+        if ~isempty(videoWriter) && isvalid(videoWriter)
+            try
+                % Create episodeSummary structure with final metrics
+                episodeSummary = struct('episode', ep, ...
+                                        'coverage', coverage, ...
+                                        'steps', steps, ...
+                                        'collision', collision, ...
+                                        'utility', U);
+                
+                % Call renderTransitionFrame() to add transition
+                renderTransitionFrame(videoWriter, episodeSummary);
+                
+                % Reset trajectory buffer for next episode
+                trajectoryBuffer = [];
+            catch ME
+                warning('Transition frame rendering failed at ep %d: %s. Training continues.', ep, getReport(ME, 'basic'));
+                % Training continues even if transition frame fails
+            end
+        end
+    end
+    
+    %% Finalize video recording at end of visualization range
+    if ep == vizEndEp
+        % Add null check for videoWriter before finalization
+        if ~isempty(videoWriter)
+            try
+                % Call finalizeVideoRecording() to close video
+                finalizeVideoRecording(videoWriter, videoFilename);
+            catch ME
+                warning('Error finalizing video recording: %s. Training continues.', getReport(ME, 'basic'));
+            end
+        end
+        
+        % Clear videoWriter variable
+        videoWriter = [];
+        
+        % Print completion message
+        fprintf('=== Visualization complete. Training continues... ===\n');
     end
 
     %% Collect metrics data for visualization
@@ -434,4 +537,432 @@ function [loss, gradients] = ppoLoss(dlnet, dlPatch, dlGlobal, actions, oldLogPr
     % Total loss
     loss = actorLoss + valueLossCoef * criticLoss;
     gradients = dlgradient(loss, dlnet.Learnables);
+end
+
+function vWriter = initializeVideoRecording(filename, frameRate)
+    % Initialize video recording with MPEG-4 format
+    % Inputs:
+    %   filename: Output video filename (e.g., 'UUV_episodes_4690_4700.mp4')
+    %   frameRate: Frames per second (e.g., 10)
+    % Returns:
+    %   vWriter: VideoWriter object or empty array on failure
+    
+    % Initialize to empty
+    vWriter = [];
+    
+    % Validate inputs
+    if isempty(filename) || ~ischar(filename)
+        warning('Invalid filename provided for video recording. Expected non-empty string.');
+        return;
+    end
+    
+    if isempty(frameRate) || ~isnumeric(frameRate) || frameRate <= 0
+        warning('Invalid frame rate provided for video recording. Expected positive number.');
+        return;
+    end
+    
+    try
+        vWriter = VideoWriter(filename, 'MPEG-4');
+        vWriter.FrameRate = frameRate;
+        vWriter.Quality = 95;
+        open(vWriter);
+        
+        % Verify the video writer is valid after opening
+        if ~isvalid(vWriter)
+            warning('VideoWriter object is invalid after initialization.');
+            vWriter = [];
+        end
+    catch ME
+        warning('Failed to initialize video recording: %s', getReport(ME, 'basic'));
+        vWriter = [];
+    end
+end
+
+function captureFrame(vWriter, env, trajectory, metrics, showVortex)
+    % Capture and render current environment state as video frame
+    % Inputs:
+    %   vWriter: VideoWriter object
+    %   env: UUVEnvMO environment instance
+    %   trajectory: Nx2 matrix of [x, y] positions
+    %   metrics: Structure with episode, timestep, coverage, rewards, action
+    %   showVortex: Boolean flag to enable vortex visualization
+    
+    % Validate videoWriter before proceeding
+    if isempty(vWriter)
+        warning('VideoWriter is empty. Skipping frame capture.');
+        return;
+    end
+    
+    if ~isvalid(vWriter)
+        warning('VideoWriter is not valid. Skipping frame capture.');
+        return;
+    end
+    
+    % Validate environment object
+    if isempty(env) || ~isobject(env)
+        warning('Invalid environment object. Skipping frame capture.');
+        return;
+    end
+    
+    % Validate metrics structure
+    if isempty(metrics) || ~isstruct(metrics)
+        warning('Invalid metrics structure. Skipping frame capture.');
+        return;
+    end
+    
+    try
+        % Create invisible figure with specified dimensions
+        fig = figure('Visible', 'off', 'Position', [100, 100, 800, 900]);
+        
+        % Create main axes for map visualization
+        ax = axes('Parent', fig, 'Position', [0.1, 0.25, 0.8, 0.65]);
+        hold(ax, 'on');
+        
+        % Render 50x50 grid map with color coding
+        mapSize = env.mapSize;
+        mapDisplay = zeros(mapSize(1), mapSize(2), 3); % RGB image
+        
+        for i = 1:mapSize(1)
+            for j = 1:mapSize(2)
+                if env.grid(i, j) == 1
+                    % Obstacle: black
+                    mapDisplay(i, j, :) = [0, 0, 0];
+                elseif env.grid(i, j) == 0
+                    % Explored free space: white
+                    mapDisplay(i, j, :) = [1, 1, 1];
+                else
+                    % Unexplored: gray
+                    mapDisplay(i, j, :) = [0.5, 0.5, 0.5];
+                end
+            end
+        end
+        
+        % Display map (no flip - grid(i,j) where i=row=Y, j=col=X)
+        % Use 'reverse' YDir to match MATLAB image convention
+        image(ax, 'XData', [0, env.width], 'YData', [0, env.height], ...
+              'CData', mapDisplay);
+        axis(ax, 'equal');
+        xlim(ax, [0, env.width]);
+        ylim(ax, [0, env.height]);
+        set(ax, 'YDir', 'reverse');
+        
+        % Render vortex visualization (before trajectory and UUV)
+        renderVortexVisualization(ax, env, showVortex);
+        
+        % Draw trajectory path as connected blue line
+        if ~isempty(trajectory) && size(trajectory, 1) > 1
+            plot(ax, trajectory(:, 1), trajectory(:, 2), 'b-', 'LineWidth', 2);
+        end
+        
+        % Draw UUV position as red triangle with orientation arrow
+        uuvX = env.pos(1);
+        uuvY = env.pos(2);
+        uuvYaw = env.yaw;
+        
+        % Triangle vertices (pointing in direction of yaw)
+        triangleSize = 15;
+        vertices = [
+            triangleSize, 0;
+            -triangleSize/2, triangleSize/2;
+            -triangleSize/2, -triangleSize/2
+        ];
+        
+        % Rotate vertices by yaw angle
+        R = [cos(uuvYaw), -sin(uuvYaw); sin(uuvYaw), cos(uuvYaw)];
+        rotatedVertices = (R * vertices')';
+        triangleX = rotatedVertices(:, 1) + uuvX;
+        triangleY = rotatedVertices(:, 2) + uuvY;
+        
+        % Draw filled triangle
+        fill(ax, triangleX, triangleY, 'r', 'EdgeColor', 'k', 'LineWidth', 1.5);
+        
+        % Draw orientation arrow
+        arrowLength = 30;
+        arrowX = [uuvX, uuvX + arrowLength * cos(uuvYaw)];
+        arrowY = [uuvY, uuvY + arrowLength * sin(uuvYaw)];
+        plot(ax, arrowX, arrowY, 'r-', 'LineWidth', 2);
+        
+        % Draw sonar FOV cone when action is 4 (sonar)
+        if metrics.action == 4
+            sonarRange = 8 * env.cellSize; % 8 cells
+            sonarFOV = pi/3; % 60 degrees
+            
+            % Create arc for sonar cone
+            angles = linspace(uuvYaw - sonarFOV, uuvYaw + sonarFOV, 30);
+            sonarX = [uuvX, uuvX + sonarRange * cos(angles), uuvX];
+            sonarY = [uuvY, uuvY + sonarRange * sin(angles), uuvY];
+            
+            % Draw semi-transparent green cone
+            fill(ax, sonarX, sonarY, 'g', 'FaceAlpha', 0.3, 'EdgeColor', 'g', 'LineWidth', 1.5);
+        end
+        
+        % Add title with episode and timestep
+        title(ax, sprintf('Episode %d | Step %d | Coverage: %.1f%%', ...
+              metrics.episode, metrics.timestep, metrics.coverage * 100), ...
+              'FontSize', 14, 'FontWeight', 'bold');
+        
+        % Add text overlay with cumulative rewards for each objective
+        rewardText = sprintf(['Time: %.3f  |  Explore: %.3f\n' ...
+                             'Sonar: %.3f  |  Collision: %.3f'], ...
+                             sum(metrics.rewards(1, :)), ...
+                             sum(metrics.rewards(2, :)), ...
+                             sum(metrics.rewards(3, :)), ...
+                             sum(metrics.rewards(4, :)));
+        
+        % Create text box at bottom of figure
+        annotation(fig, 'textbox', [0.1, 0.05, 0.8, 0.15], ...
+                   'String', rewardText, ...
+                   'FontSize', 12, ...
+                   'HorizontalAlignment', 'center', ...
+                   'VerticalAlignment', 'middle', ...
+                   'EdgeColor', 'black', ...
+                   'LineWidth', 1.5, ...
+                   'BackgroundColor', 'white');
+        
+        % Capture frame using getframe()
+        frame = getframe(fig);
+        
+        % Validate frame before writing
+        if isempty(frame) || ~isfield(frame, 'cdata')
+            warning('Invalid frame captured. Skipping frame write.');
+            close(fig);
+            return;
+        end
+        
+        % Write frame to video using writeVideo()
+        writeVideo(vWriter, frame);
+        
+        % Close figure to free memory
+        close(fig);
+        
+    catch ME
+        warning('Frame capture failed: %s', getReport(ME, 'basic'));
+        % Close figure if it exists
+        if exist('fig', 'var') && ishandle(fig)
+            try
+                close(fig);
+            catch
+                % Silently fail if figure cannot be closed
+            end
+        end
+    end
+end
+
+function renderTransitionFrame(vWriter, episodeSummary)
+    % Render episode transition frame with summary statistics
+    % Inputs:
+    %   vWriter: VideoWriter object
+    %   episodeSummary: Structure with episode, coverage, steps, collision, utility
+    
+    % Validate videoWriter before proceeding
+    if isempty(vWriter)
+        warning('VideoWriter is empty. Skipping transition frame.');
+        return;
+    end
+    
+    if ~isvalid(vWriter)
+        warning('VideoWriter is not valid. Skipping transition frame.');
+        return;
+    end
+    
+    % Validate episodeSummary structure
+    if isempty(episodeSummary) || ~isstruct(episodeSummary)
+        warning('Invalid episode summary structure. Skipping transition frame.');
+        return;
+    end
+    
+    % Validate required fields in episodeSummary
+    requiredFields = {'episode', 'coverage', 'steps', 'collision', 'utility'};
+    for i = 1:length(requiredFields)
+        if ~isfield(episodeSummary, requiredFields{i})
+            warning('Missing required field "%s" in episode summary. Skipping transition frame.', requiredFields{i});
+            return;
+        end
+    end
+    
+    try
+        % Create text-only figure with episode summary
+        fig = figure('Visible', 'off', 'Position', [100, 100, 800, 900]);
+        
+        % Create axes for text display
+        ax = axes('Parent', fig, 'Position', [0.1, 0.1, 0.8, 0.8]);
+        axis(ax, 'off');
+        
+        % Display episode number
+        text(ax, 0.5, 0.75, sprintf('EPISODE %d COMPLETE', episodeSummary.episode), ...
+             'FontSize', 24, 'FontWeight', 'bold', ...
+             'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+        
+        % Display coverage
+        text(ax, 0.5, 0.60, sprintf('Coverage: %.1f%%', episodeSummary.coverage * 100), ...
+             'FontSize', 18, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+        
+        % Display steps
+        text(ax, 0.5, 0.50, sprintf('Steps: %d', episodeSummary.steps), ...
+             'FontSize', 18, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+        
+        % Display collision status
+        if episodeSummary.collision
+            statusText = 'Status: Collision';
+            statusColor = [0.8, 0, 0]; % Red
+        else
+            statusText = 'Status: Goal Reached';
+            statusColor = [0, 0.6, 0]; % Green
+        end
+        text(ax, 0.5, 0.40, statusText, ...
+             'FontSize', 18, 'Color', statusColor, ...
+             'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+        
+        % Display utility
+        text(ax, 0.5, 0.30, sprintf('Utility: %.3f', episodeSummary.utility), ...
+             'FontSize', 18, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+        
+        % Display next episode message
+        text(ax, 0.5, 0.15, '(Next episode starting...)', ...
+             'FontSize', 14, 'FontStyle', 'italic', 'Color', [0.5, 0.5, 0.5], ...
+             'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+        
+        % Capture frame as image
+        frame = getframe(fig);
+        
+        % Validate frame before writing
+        if isempty(frame) || ~isfield(frame, 'cdata')
+            warning('Invalid transition frame captured. Skipping transition.');
+            close(fig);
+            return;
+        end
+        
+        % Write 10 identical frames to video (1 second at 10 fps)
+        for i = 1:10
+            try
+                writeVideo(vWriter, frame);
+            catch ME
+                warning('Failed to write transition frame %d/10: %s', i, getReport(ME, 'basic'));
+                break; % Stop writing frames if one fails
+            end
+        end
+        
+        % Close figure
+        close(fig);
+        
+    catch ME
+        warning('Transition frame rendering failed: %s', getReport(ME, 'basic'));
+        % Close figure if it exists
+        if exist('fig', 'var') && ishandle(fig)
+            try
+                close(fig);
+            catch
+                % Silently fail if figure cannot be closed
+            end
+        end
+    end
+end
+
+function finalizeVideoRecording(vWriter, filename)
+    % Finalize video recording and close video file
+    % Inputs:
+    %   vWriter: VideoWriter object
+    %   filename: Video filename for confirmation message
+    
+    % Validate videoWriter before proceeding
+    if isempty(vWriter)
+        warning('VideoWriter is empty. Nothing to finalize.');
+        return;
+    end
+    
+    if ~isvalid(vWriter)
+        warning('VideoWriter is not valid. Cannot finalize video.');
+        return;
+    end
+    
+    try
+        % Close VideoWriter object
+        close(vWriter);
+        
+        % Verify file was created
+        videoPath = fullfile(pwd, filename);
+        if exist(videoPath, 'file')
+            % Print confirmation message with file location
+            fprintf('=== Video recording complete: %s ===\n', filename);
+            fprintf('Video saved to: %s\n', videoPath);
+            
+            % Display file size for verification
+            fileInfo = dir(videoPath);
+            fileSizeMB = fileInfo.bytes / (1024 * 1024);
+            fprintf('Video file size: %.2f MB\n', fileSizeMB);
+        else
+            warning('Video file was not created at expected location: %s', videoPath);
+        end
+    catch ME
+        % Handle errors gracefully with try-catch
+        warning('Failed to finalize video: %s', getReport(ME, 'basic'));
+    end
+end
+
+function [X, Y, U, V] = sampleCurrentField(env, numSamplesX, numSamplesY)
+    % Sample the ocean current field at a grid of points
+    % Inputs:
+    %   env: UUVEnvMO environment instance
+    %   numSamplesX: Number of sample points in X direction
+    %   numSamplesY: Number of sample points in Y direction
+    % Returns:
+    %   X, Y: Meshgrid arrays of sample point coordinates
+    %   U, V: Velocity components at each sample point
+    
+    % Generate uniform grid of sample points
+    x = linspace(0, env.width, numSamplesX);
+    y = linspace(0, env.height, numSamplesY);
+    [X, Y] = meshgrid(x, y);
+    
+    % Evaluate current field at each point
+    U = zeros(size(X));
+    V = zeros(size(Y));
+    for i = 1:numel(X)
+        [U(i), V(i)] = env.currentField(X(i), Y(i));
+    end
+end
+
+function renderVortexVisualization(ax, env, showVortex)
+    % Render ocean current vortex visualization
+    % Inputs:
+    %   ax: Axes handle for plotting
+    %   env: UUVEnvMO environment instance
+    %   showVortex: Boolean flag to enable/disable visualization
+    
+    if ~showVortex
+        return;
+    end
+    
+    % Check if environment has current field parameters
+    if isempty(env.currentCenter) || isempty(env.currentSigma) || isempty(env.currentStrength)
+        warning('Ocean current parameters not initialized. Skipping vortex visualization.');
+        return;
+    end
+    
+    % Sample current field
+    numSamplesX = 12;
+    numSamplesY = 12;
+    [X, Y, U, V] = sampleCurrentField(env, numSamplesX, numSamplesY);
+    
+    % Calculate arrow scaling
+    maxVelocity = max(sqrt(U(:).^2 + V(:).^2));
+    if maxVelocity > 0
+        scaleFactor = 50 / maxVelocity;  % Scale so max arrow is ~50m
+    else
+        scaleFactor = 1;
+    end
+    
+    % Render velocity vectors as arrows
+    quiver(ax, X, Y, U * scaleFactor, V * scaleFactor, ...
+           'Color', [0.2, 0.6, 0.8], ...  % Light blue
+           'LineWidth', 1.2, ...
+           'MaxHeadSize', 0.5, ...
+           'AutoScale', 'off');
+    
+    % Mark vortex center
+    plot(ax, env.currentCenter(1), env.currentCenter(2), ...
+         'o', 'MarkerSize', 10, ...
+         'MarkerFaceColor', [0.2, 0.6, 0.8], ...
+         'MarkerEdgeColor', 'k', ...
+         'LineWidth', 2);
 end

@@ -44,6 +44,11 @@ classdef UUVEnvMO < handle
         obstacleSizeRange
         startSafeRadius
         obstacleBuffer
+        
+        % 安全区域属性
+        safeZoneRows       % [minRow, maxRow] 安全区域行索引
+        safeZoneCols       % [minCol, maxCol] 安全区域列索引
+        safeZoneCenter     % [centerRow, centerCol] 安全区域中心
     end
 
     methods
@@ -58,9 +63,9 @@ classdef UUVEnvMO < handle
             obj.dt = 1.0;
             obj.deltaYaw = pi/12;
 
-            obj.maxSteps = 1000;
-            obj.targetCoverage = 0.9;
-            obj.quickCoverageThreshold = 0.7;
+            obj.maxSteps = 2048;
+            obj.targetCoverage = 1;
+            obj.quickCoverageThreshold = 0.95;
 
             obj.currentCenter = [obj.width/2; obj.height/2];
             obj.currentSigma = obj.width/2;
@@ -78,8 +83,9 @@ classdef UUVEnvMO < handle
             obj.startSafeRadius = 5;
             obj.obstacleBuffer = 3;
 
-            obj.pos = [obj.width/2; obj.height/2];
-            obj.yaw = 0;
+            % 使用新的初始化系统
+            obj.initializeEnvironment();
+            
             obj.stepCount = 0;
             obj.sonarSteps = 0;
             obj.doneFlag = false;
@@ -91,59 +97,17 @@ classdef UUVEnvMO < handle
         end
 
         function state = reset(obj)
-            % 随机生成地图并重置状态
-            Ny = obj.mapSize(1);
-            Nx = obj.mapSize(2);
-
-            obj.trueMap = zeros(obj.mapSize);
-            countRange = obj.obstacleCountRange;
-            sizeRange = obj.obstacleSizeRange;
-            numObs = randi([countRange(1), countRange(2)]);
-
-            ic = floor(Ny/2);
-            jc = floor(Nx/2);
-            safeRows = [max(1, ic - obj.startSafeRadius), min(Ny, ic + obj.startSafeRadius)];
-            safeCols = [max(1, jc - obj.startSafeRadius), min(Nx, jc + obj.startSafeRadius)];
-
-            for k = 1:numObs
-                placed = false;
-                attempts = 0;
-                while ~placed && attempts < 50
-                    attempts = attempts + 1;
-                    w = randi([sizeRange(1), sizeRange(2)]);
-                    h = randi([sizeRange(1), sizeRange(2)]);
-                    w = min(w, Nx-1);
-                    h = min(h, Ny-1);
-                    i0 = randi([1, Ny - h]);
-                    j0 = randi([1, Nx - w]);
-                    i1 = i0;
-                    i2 = i0 + h - 1;
-                    j1 = j0;
-                    j2 = j0 + w - 1;
-
-                    rowSafe = (i2 < safeRows(1) - obj.obstacleBuffer) || (i1 > safeRows(2) + obj.obstacleBuffer);
-                    colSafe = (j2 < safeCols(1) - obj.obstacleBuffer) || (j1 > safeCols(2) + obj.obstacleBuffer);
-                    if ~(rowSafe || colSafe)
-                        continue;
-                    end
-
-                    obj.trueMap(i1:i2, j1:j2) = 1;
-                    placed = true;
-                end
-            end
-
-            obj.trueMap(safeRows(1):safeRows(2), safeCols(1):safeCols(2)) = 0;
-
-            obj.grid = -1 * ones(obj.mapSize);
+            % 使用新的初始化系统重置环境
+            obj.initializeEnvironment();
+            
+            % 重置计数器
             obj.freeCellsTotal = nnz(obj.trueMap == 0);
             obj.knownFreeCount = 0;
             obj.stepCount = 0;
             obj.sonarSteps = 0;
             obj.doneFlag = false;
 
-            obj.pos = [obj.width/2; obj.height/2];
-            obj.yaw = 0;
-
+            % 初始化已知地图
             [i, j] = obj.posToIdx(obj.pos(1), obj.pos(2));
             obj.grid(i, j) = obj.trueMap(i, j);
             if obj.trueMap(i, j) == 0
@@ -351,8 +315,180 @@ classdef UUVEnvMO < handle
                 end
             end
         end
+        
+        function generateObstacles(obj)
+            % 生成障碍物，避开安全区域
+            Ny = obj.mapSize(1);
+            Nx = obj.mapSize(2);
+            
+            countRange = obj.obstacleCountRange;
+            sizeRange = obj.obstacleSizeRange;
+            numObs = randi([countRange(1), countRange(2)]);
+            
+            ic = floor(Ny/2);
+            jc = floor(Nx/2);
+            safeRows = [max(1, ic - obj.startSafeRadius), min(Ny, ic + obj.startSafeRadius)];
+            safeCols = [max(1, jc - obj.startSafeRadius), min(Nx, jc + obj.startSafeRadius)];
+            
+            for k = 1:numObs
+                placed = false;
+                attempts = 0;
+                while ~placed && attempts < 50
+                    attempts = attempts + 1;
+                    w = randi([sizeRange(1), sizeRange(2)]);
+                    h = randi([sizeRange(1), sizeRange(2)]);
+                    w = min(w, Nx-1);
+                    h = min(h, Ny-1);
+                    i0 = randi([1, Ny - h]);
+                    j0 = randi([1, Nx - w]);
+                    i1 = i0;
+                    i2 = i0 + h - 1;
+                    j1 = j0;
+                    j2 = j0 + w - 1;
+                    
+                    rowSafe = (i2 < safeRows(1) - obj.obstacleBuffer) || (i1 > safeRows(2) + obj.obstacleBuffer);
+                    colSafe = (j2 < safeCols(1) - obj.obstacleBuffer) || (j1 > safeCols(2) + obj.obstacleBuffer);
+                    if ~(rowSafe || colSafe)
+                        continue;
+                    end
+                    
+                    obj.trueMap(i1:i2, j1:j2) = 1;
+                    placed = true;
+                end
+            end
+        end
+        
+        function initializeOceanCurrent(obj)
+            % 初始化洋流参数
+            obj.currentCenter = [obj.width/2; obj.height/2];
+            obj.currentSigma = obj.width/2;
+            obj.currentStrength = 5e-4;
+        end
+        
+        function clearSafeZone(obj)
+            % 清空安全区域并存储边界
+            Ny = obj.mapSize(1);
+            Nx = obj.mapSize(2);
+            
+            ic = floor(Ny / 2);
+            jc = floor(Nx / 2);
+            obj.safeZoneRows = [max(1, ic - obj.startSafeRadius), min(Ny, ic + obj.startSafeRadius)];
+            obj.safeZoneCols = [max(1, jc - obj.startSafeRadius), min(Nx, jc + obj.startSafeRadius)];
+            obj.safeZoneCenter = [ic, jc];
+            
+            % 显式清空安全区域
+            obj.trueMap(obj.safeZoneRows(1):obj.safeZoneRows(2), ...
+                        obj.safeZoneCols(1):obj.safeZoneCols(2)) = 0;
+            
+            % 验证至少有一个自由网格
+            freeCellsInSafeZone = nnz(obj.trueMap(obj.safeZoneRows(1):obj.safeZoneRows(2), ...
+                                                  obj.safeZoneCols(1):obj.safeZoneCols(2)) == 0);
+            if freeCellsInSafeZone == 0
+                error('Safe zone contains no free cells after clearing');
+            end
+        end
+        
+        function generateSafeStartPosition(obj)
+            % 在安全区域内生成随机起始位置
+            validStart = false;
+            maxAttempts = 100;
+            attempt = 0;
+            
+            % 计算安全区域的连续坐标边界
+            [minX, minY] = obj.idxToPos(obj.safeZoneRows(1), obj.safeZoneCols(1));
+            [maxX, maxY] = obj.idxToPos(obj.safeZoneRows(2), obj.safeZoneCols(2));
+            
+            % 添加边界边距
+            margin = 2 * obj.cellSize;
+            minX = max(minX, margin);
+            minY = max(minY, margin);
+            maxX = min(maxX, obj.width - margin);
+            maxY = min(maxY, obj.height - margin);
+            
+            % 尝试随机采样
+            while ~validStart && attempt < maxAttempts
+                attempt = attempt + 1;
+                
+                % 在安全区域内均匀随机采样
+                randX = minX + rand() * (maxX - minX);
+                randY = minY + rand() * (maxY - minY);
+                
+                % 转换为网格索引并验证
+                [i, j] = obj.posToIdx(randX, randY);
+                
+                % 检查：在安全区域内 且 是自由网格
+                if i >= obj.safeZoneRows(1) && i <= obj.safeZoneRows(2) && ...
+                   j >= obj.safeZoneCols(1) && j <= obj.safeZoneCols(2) && ...
+                   obj.trueMap(i, j) == 0
+                    obj.pos = [randX; randY];
+                    validStart = true;
+                end
+            end
+            
+            % 回退到安全区域中心
+            if ~validStart
+                [centerX, centerY] = obj.idxToPos(obj.safeZoneCenter(1), obj.safeZoneCenter(2));
+                obj.pos = [centerX; centerY];
+                
+                % 验证回退位置是安全的
+                [i, j] = obj.posToIdx(obj.pos(1), obj.pos(2));
+                if obj.trueMap(i, j) ~= 0
+                    error('Fallback position at safe zone center is not a free cell');
+                end
+                
+                warning('Failed to find random safe start position after %d attempts. Using safe zone center.', maxAttempts);
+            end
+        end
+        
+        function validateStartState(obj)
+            % 验证起始状态
+            [i, j] = obj.posToIdx(obj.pos(1), obj.pos(2));
+            
+            % 验证UUV位置在自由网格
+            if obj.trueMap(i, j) ~= 0
+                error('UUV starting position (%d, %d) is not in a free cell', i, j);
+            end
+            
+            % 验证位置在安全区域内
+            if i < obj.safeZoneRows(1) || i > obj.safeZoneRows(2) || ...
+               j < obj.safeZoneCols(1) || j > obj.safeZoneCols(2)
+                error('UUV starting position (%d, %d) is outside safe zone', i, j);
+            end
+            
+            % 验证边界边距
+            margin = 2 * obj.cellSize;
+            if obj.pos(1) < margin || obj.pos(1) > obj.width - margin || ...
+               obj.pos(2) < margin || obj.pos(2) > obj.height - margin
+                warning('UUV starting position violates boundary margin');
+            end
+        end
+        
+        function initializeEnvironment(obj)
+            % 协调完整的初始化序列
+            % 步骤1: 初始化地图结构
+            obj.trueMap = zeros(obj.mapSize);
+            obj.grid = -1 * ones(obj.mapSize);
+            
+            % 步骤2: 生成障碍物（尊重安全区域）
+            obj.generateObstacles();
+            
+            % 步骤3: 清空并验证安全区域
+            obj.clearSafeZone();
+            
+            % 步骤4: 初始化洋流参数
+            obj.initializeOceanCurrent();
+            
+            % 步骤5: 生成随机安全起始位置
+            obj.generateSafeStartPosition();
+            
+            % 步骤6: 设置随机方向
+            obj.yaw = -pi + 2 * pi * rand();
+            
+            % 步骤7: 最终验证
+            obj.validateStartState();
+        end
     end
-
+    
     methods (Static)
         function ang = wrapToPiLocal(ang)
             ang = mod(ang + pi, 2*pi) - pi;
